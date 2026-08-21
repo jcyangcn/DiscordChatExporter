@@ -629,6 +629,60 @@ public class DiscordClient(
         return response.EnumerateArray().Select(Message.Parse).LastOrDefault();
     }
 
+    public async ValueTask<Message?> TryGetMessageAsync(
+        Snowflake channelId,
+        Snowflake messageId,
+        CancellationToken cancellationToken = default
+    )
+    {
+        // Use the regular message listing endpoint with the 'around' parameter instead of the
+        // dedicated single-message endpoint, because the latter is not accessible to user tokens.
+        var url = new UrlBuilder()
+            .SetPath($"channels/{channelId}/messages")
+            .SetQueryParameter("around", messageId.ToString())
+            .SetQueryParameter("limit", "1")
+            .Build();
+
+        // Can be null on channels that the user cannot access
+        var response = await TryGetJsonResponseAsync(url, cancellationToken);
+        if (response is null)
+            return null;
+
+        // The endpoint returns messages around the requested ID, so make sure to only return
+        // the message that exactly matches it (it may be absent if it has been deleted).
+        return response
+            .Value.EnumerateArray()
+            .Select(Message.Parse)
+            .FirstOrDefault(m => m.Id == messageId);
+    }
+
+    private async ValueTask<Message?> ResolveThreadStarterMessageAsync(
+        Message message,
+        CancellationToken cancellationToken = default
+    )
+    {
+        // Threads created from a message contain an empty THREAD_STARTER_MESSAGE placeholder at
+        // the top of their history (in place of the actual starter message) that merely points
+        // back to the originating message in the parent channel. Resolve the placeholder to that
+        // actual message so the thread's starter message appears in the output, in its correct
+        // chronological position, with its real content.
+        // This doesn't apply to forum/media posts, whose starter message is already a regular
+        // message in the thread's own history (i.e. not a placeholder).
+        // https://github.com/Tyrrrz/DiscordChatExporter/issues/1265
+        if (message.Kind != MessageKind.ThreadStarterMessage)
+            return message;
+
+        // The placeholder references the parent channel and the original message it points to.
+        if (message.Reference?.ChannelId is not { } channelId)
+            return null;
+        if (message.Reference?.MessageId is not { } messageId)
+            return null;
+
+        // The original message may no longer be accessible (e.g. deleted), in which case the
+        // empty placeholder is dropped as well.
+        return await TryGetMessageAsync(channelId, messageId, cancellationToken);
+    }
+
     public async IAsyncEnumerable<Message> GetMessagesAsync(
         Snowflake channelId,
         Snowflake? after = null,
@@ -701,7 +755,15 @@ public class DiscordClient(
                     );
                 }
 
-                yield return message;
+                // Thread starter messages are returned as empty placeholders; resolve them to
+                // the actual message they reference before yielding (or skip if unavailable).
+                var resolvedMessage = await ResolveThreadStarterMessageAsync(
+                    message,
+                    cancellationToken
+                );
+                if (resolvedMessage is not null)
+                    yield return resolvedMessage;
+
                 currentAfter = message.Id;
             }
         }
@@ -769,7 +831,14 @@ public class DiscordClient(
                     );
                 }
 
-                yield return message;
+                // Thread starter messages are returned as empty placeholders; resolve them to
+                // the actual message they reference before yielding (or skip if unavailable).
+                var resolvedMessage = await ResolveThreadStarterMessageAsync(
+                    message,
+                    cancellationToken
+                );
+                if (resolvedMessage is not null)
+                    yield return resolvedMessage;
             }
 
             currentBefore = messages.Last().Id;
